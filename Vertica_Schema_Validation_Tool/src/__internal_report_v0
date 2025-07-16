@@ -2,6 +2,7 @@
 """
 Vertica Pre & Post-upgrade Schema Comparison Program
 Interactive version with comparison and backup functionality
+Modified to handle multiple nodes in Vertica cluster
 """
 
 import vertica_python
@@ -14,12 +15,13 @@ import sys
 import zipfile
 import tarfile
 import pickle
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import argparse
 import getpass
 import subprocess
 import platform
 import warnings
+import re
 
 # Suppress vertica_python TLS warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="vertica_python")
@@ -29,7 +31,7 @@ class VerticaSchemaExtractor:
     def __init__(self, host: str, port: int, username: str, password: str, database: str):
         """
         Initialize Vertica connection parameters
-        
+
         Args:
             host: Vertica server hostname
             port: Vertica server port
@@ -48,7 +50,7 @@ class VerticaSchemaExtractor:
             'tlsmode': 'disable'  # Disable TLS to avoid warnings
         }
         self.connection = None
-    
+
     def connect(self):
         """Establish connection to Vertica database"""
         try:
@@ -58,21 +60,21 @@ class VerticaSchemaExtractor:
         except Exception as e:
             print(f"✗ Error connecting to Vertica: {str(e)}")
             return False
-    
+
     def disconnect(self):
         """Close database connection"""
         if self.connection:
             self.connection.close()
             print("✓ Disconnected from Vertica database")
-    
+
     def execute_schema_query(self, env_version: str = "13.3", table_pattern: str = "CDR_S1AP") -> List[Dict[str, Any]]:
         """
         Execute the schema comparison query
-        
+
         Args:
             env_version: Environment version identifier (not used in final query)
             table_pattern: Table name pattern (not used in final query)
-            
+
         Returns:
             List of dictionaries containing query results
         """
@@ -82,122 +84,122 @@ class VerticaSchemaExtractor:
                table_column_name,
                data_type,
                encoding_type,
-               sort_position 
-        FROM projection_columns 
-        GROUP BY table_schema, table_name, table_column_name, data_type, encoding_type, sort_position 
+               sort_position
+        FROM projection_columns
+        GROUP BY table_schema, table_name, table_column_name, data_type, encoding_type, sort_position
         ORDER BY sort_position DESC
         """
-        
+
         try:
             cursor = self.connection.cursor()
             cursor.execute(query)
-            
+
             # Get column names
             columns = [desc[0] for desc in cursor.description]
-            
+
             # Fetch all results
             results = cursor.fetchall()
-            
+
             # Convert to list of dictionaries
             schema_data = []
             for row in results:
                 schema_data.append(dict(zip(columns, row)))
-            
+
             cursor.close()
             print(f"✓ Retrieved {len(schema_data)} schema records")
             return schema_data
-            
+
         except Exception as e:
             print(f"✗ Error executing query: {str(e)}")
             return []
-    
+
     def save_to_csv(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
         """Save schema data to CSV file"""
         if not data:
             if not silent:
                 print("⚠ No data to save")
             return False
-        
+
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = data[0].keys()
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                
+
                 writer.writeheader()
                 writer.writerows(data)
-            
+
             if not silent:
                 print(f"✓ Schema data saved to CSV: {filename}")
             return True
-            
+
         except Exception as e:
             if not silent:
                 print(f"✗ Error saving to CSV: {str(e)}")
             return False
-    
+
     def save_to_json(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
         """Save schema data to JSON file"""
         if not data:
             if not silent:
                 print("⚠ No data to save")
             return False
-        
+
         try:
             with open(filename, 'w', encoding='utf-8') as jsonfile:
                 json.dump(data, jsonfile, indent=2, default=str)
-            
+
             if not silent:
                 print(f"✓ Schema data saved to JSON: {filename}")
             return True
-            
+
         except Exception as e:
             if not silent:
                 print(f"✗ Error saving to JSON: {str(e)}")
             return False
-    
+
     def save_to_excel(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
         """Save schema data to Excel file"""
         if not data:
             if not silent:
                 print("⚠ No data to save")
             return False
-        
+
         try:
             df = pd.DataFrame(data)
             df.to_excel(filename, index=False, engine='openpyxl')
             if not silent:
                 print(f"✓ Schema data saved to Excel: {filename}")
             return True
-            
+
         except Exception as e:
             if not silent:
                 print(f"✗ Error saving to Excel: {str(e)}")
             return False
-    
+
     def save_to_pickle(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
         """Save schema data to pickle file for backup purposes"""
         if not data:
             if not silent:
                 print("⚠ No data to save")
             return False
-        
+
         try:
             with open(filename, 'wb') as picklefile:
                 pickle.dump(data, picklefile)
-            
+
             if not silent:
                 print(f"✓ Schema data saved to Pickle: {filename}")
             return True
-            
+
         except Exception as e:
             if not silent:
                 print(f"✗ Error saving to Pickle: {str(e)}")
             return False
-    
+
     def create_archive(self, files_to_archive: List[str], archive_name: str, archive_type: str = "zip"):
         """
         Create archive with specified files
-        
+
         Args:
             files_to_archive: List of file paths to include in archive
             archive_name: Name of the archive file
@@ -212,7 +214,7 @@ class VerticaSchemaExtractor:
                             print(f"  ✓ Added {file_path} to archive")
                         else:
                             print(f"  ⚠ File not found: {file_path}")
-            
+
             elif archive_type.lower() == "tar":
                 with tarfile.open(archive_name, 'w:gz') as tarf:
                     for file_path in files_to_archive:
@@ -221,18 +223,18 @@ class VerticaSchemaExtractor:
                             print(f"  ✓ Added {file_path} to archive")
                         else:
                             print(f"  ⚠ File not found: {file_path}")
-            
+
             print(f"✓ Archive created: {archive_name}")
             return True
-            
+
         except Exception as e:
             print(f"✗ Error creating archive: {str(e)}")
             return False
-    
+
     def create_archive_silent(self, files_to_archive: List[str], archive_name: str):
         """
         Create ZIP archive silently without verbose output
-        
+
         Args:
             files_to_archive: List of file paths to include in archive
             archive_name: Name of the archive file
@@ -243,11 +245,11 @@ class VerticaSchemaExtractor:
                     if os.path.exists(file_path):
                         zipf.write(file_path, os.path.basename(file_path))
             return True
-            
+
         except Exception as e:
             print(f"✗ Error creating archive: {str(e)}")
             return False
-    
+
     def cleanup_temp_files_silent(self, files_to_delete: List[str]):
         """Clean up temporary files silently"""
         for file_path in files_to_delete:
@@ -261,10 +263,10 @@ class VerticaSchemaExtractor:
 def ping_host(hostname):
     """
     Ping the hostname to check connectivity
-    
+
     Args:
         hostname: The hostname to ping
-        
+
     Returns:
         bool: True if ping successful, False otherwise
     """
@@ -274,27 +276,90 @@ def ping_host(hostname):
             cmd = ["ping", "-n", "3", hostname]
         else:
             cmd = ["ping", "-c", "3", hostname]
-        
+
         # Execute ping command
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return result.returncode == 0
-        
+
     except Exception as e:
         print(f"⚠ Error during ping: {str(e)}")
         return False
 
 
+def parse_vertica_nodes(hostname_output: str) -> List[str]:
+    """
+    Parse the hostname output to extract individual Vertica node IPs
+
+    Args:
+        hostname_output: Raw output from the hostname command
+
+    Returns:
+        List of individual IP addresses
+    """
+    if not hostname_output:
+        return []
+
+    # Clean up the output - remove brackets, whitespace, and split by common delimiters
+    cleaned_output = hostname_output.strip().replace('[', '').replace(']', '')
+
+    # Split by common delimiters (comma, semicolon, space, newline)
+    potential_ips = re.split(r'[,;\s\n]+', cleaned_output)
+
+    # Filter out empty strings and validate IP format
+    valid_ips = []
+    ip_pattern = re.compile(r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$')
+
+    for ip in potential_ips:
+        ip = ip.strip()
+        if ip and ip_pattern.match(ip):
+            valid_ips.append(ip)
+
+    return valid_ips
+
+
+def test_vertica_nodes(node_ips: List[str]) -> Optional[str]:
+    """
+    Test connectivity to multiple Vertica nodes and return the first accessible one
+
+    Args:
+        node_ips: List of IP addresses to test
+
+    Returns:
+        First accessible IP address or None if none are accessible
+    """
+    if not node_ips:
+        return None
+
+    print(f"\n🔍 Found {len(node_ips)} Vertica nodes:")
+    for i, ip in enumerate(node_ips, 1):
+        print(f"  {i}. {ip}")
+
+    print(f"\n🔍 Testing connectivity to Vertica nodes...")
+
+    for i, ip in enumerate(node_ips, 1):
+        print(f"  Testing node {i}/{len(node_ips)}: {ip}...", end=" ")
+
+        if ping_host(ip):
+            print("✓ ACCESSIBLE")
+            return ip
+        else:
+            print("✗ Not accessible")
+
+    return None
+
+
 def get_hostname():
     """
     Interactive function to get hostname with ping verification
-    
+    Modified to handle multiple Vertica nodes
+
     Returns:
         str: Verified hostname or None if user chooses to exit
     """
     print("\n" + "="*60)
     print("    VERTICA SCHEMA EXTRACTION TOOL")
     print("="*60)
-    
+
     while True:
         print("\n" + "-"*40)
         print("Connection Setup:")
@@ -306,24 +371,35 @@ def get_hostname():
         global site_chosen
         site_chosen = input("Enter the site name from above list : ")
         print("\033[94mSite\033[0m" + " " + site_chosen + " has been selected.")
+
         hostname_cmd = f"curl -s http://127.0.0.1:8084/MaveriQConductor/machines | grep '\\[Machine\\]:' -A15 | grep -w \"site={site_chosen}\"  -A3 -B13 | grep -Ew \"type=vertica\" -A10 -B3 | grep -E \"rprb_26071_oam_direct_net_1\" | sed -e 's/$/]/g' -e 's/.*oam_direct_net_1://g' -e 's/;.*//g'"
-        hostname = os.popen(hostname_cmd).read().strip()
-        print(hostname)
-        if not hostname:
+        hostname_output = os.popen(hostname_cmd).read().strip()
+
+        print(f"Raw hostname output: {hostname_output}")
+
+        if not hostname_output:
             print("⚠ No Vertica found in selected Site. Please try another Site.")
             continue
-        
-        print(f"\n🔍 Checking connectivity to {hostname}...")
-        
-        if ping_host(hostname):
-            print("✓ Connection OK")
-            return hostname
+
+        # Parse multiple nodes from the output
+        node_ips = parse_vertica_nodes(hostname_output)
+
+        if not node_ips:
+            print("⚠ No valid Vertica node IPs found. Please try another Site.")
+            continue
+
+        # Test connectivity to nodes and get the first accessible one
+        accessible_node = test_vertica_nodes(node_ips)
+
+        if accessible_node:
+            print(f"\n✓ Using Vertica node: {accessible_node}")
+            return accessible_node
         else:
-            print("✗ Vertica Not Available")
+            print("\n✗ No Vertica nodes are accessible")
             print("\nOptions:")
-            print("1. Try another hostname")
+            print("1. Try another site")
             print("2. Exit")
-            
+
             while True:
                 try:
                     choice = int(input("\nEnter your choice (1 or 2): ").strip())
@@ -339,30 +415,30 @@ def get_hostname():
 
 def get_user_input():
     """Interactive function to get user preferences"""
-    
+
     # Get hostname with ping verification
     hostname = get_hostname()
     if not hostname:
         print("\n👋 Goodbye!")
         return None
-    
+
     # Fixed connection parameters
     username = "dbadmin"
     password = "dbadmin"
     port = 5433
     database = "vdb"
-    
+
     # Fixed query parameters
     env_version = "13.3"
     table_pattern = "CDR_S1AP"
-    
+
     # Get purpose
     print("\n" + "-"*40)
     print("Select the purpose to run the program:")
     print("-"*40)
     print("1. Create Report for comparison")
     print("2. Create Report for Backup")
-    
+
     while True:
         try:
             purpose = int(input("\nEnter your choice (1 or 2): ").strip())
@@ -372,7 +448,7 @@ def get_user_input():
                 print("Please enter either 1 or 2")
         except ValueError:
             print("Please enter a valid number (1 or 2)")
-    
+
     # Fixed output format - CSV only for comparison, ZIP archive for backup
     if purpose == 1:  # Comparison
         output_format = 'csv'
@@ -380,7 +456,7 @@ def get_user_input():
     else:  # Backup - automatically use ZIP format
         output_format = 'backup'
         archive_format = 'zip'
-    
+
     return {
         'purpose': purpose,
         'host': hostname,
@@ -400,15 +476,15 @@ def main():
     try:
         # Get user input
         config = get_user_input()
-        
+
         # Check if user chose to exit
         if config is None:
             return
-        
+
         print("\n" + "="*60)
         print("    PROCESSING...")
         print("="*60)
-        
+
         # Create schema extractor
         extractor = VerticaSchemaExtractor(
             host=config['host'],
@@ -417,59 +493,59 @@ def main():
             password=config['password'],
             database=config['database']
         )
-        
+
         # Connect to database
         if not extractor.connect():
             print("\n✗ Failed to connect to database. Exiting...")
             return
-        
+
         try:
             # Remove verbose processing messages for backup
             if config['purpose'] == 1:  # Only show for comparison
                 print(f"\n🔍 Executing schema query...")
             schema_data = extractor.execute_schema_query(config['env_version'], config['table_pattern'])
-            
+
             if not schema_data:
                 print("✗ No schema data retrieved. Exiting...")
                 return
-            
+
             # Generate timestamp for filenames
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             base_filename = f"vertica_schema_Pre_{timestamp}"
-            
+
             if config['purpose'] == 1:  # Only show for comparison
                 print(f"\n📊 Processing {len(schema_data)} records...")
-            
+
             if config['purpose'] == 1:  # Comparison Report
                 print(f"\n📄 Creating comparison report in CSV format...")
-                
+
                 csv_file = f"../Reports/{base_filename}.csv"
                 if extractor.save_to_csv(schema_data, csv_file):
                     print(f"\n✅ Comparison report created successfully inside Reports Directory !")
                     print(f"📁 File created: {csv_file}")
                 else:
                     print(f"\n✗ Failed to create comparison report")
-            
+
             else:  # Backup Report
                 print(f"\n💾 Creating backup archive in ZIP format...")
-                
+
                 # Create files in multiple formats for comprehensive backup
                 temp_files = []
-                
+
                 csv_file = f"{base_filename}.csv"
                 json_file = f"{base_filename}.json"
                 pickle_file = f"{base_filename}.pkl"
-                
+
                 # Save files silently (without print statements)
                 if extractor.save_to_csv(schema_data, csv_file, silent=True):
                     temp_files.append(csv_file)
-                
+
                 if extractor.save_to_json(schema_data, json_file, silent=True):
                     temp_files.append(json_file)
-                
+
                 if extractor.save_to_pickle(schema_data, pickle_file, silent=True):
                     temp_files.append(pickle_file)
-                
+
                 # Create metadata file with query and connection info
                 metadata = {
                     'extraction_timestamp': datetime.now().isoformat(),
@@ -480,31 +556,31 @@ def main():
                     'records_count': len(schema_data),
                     'query_used': "SELECT table_schema, table_name, table_column_name, data_type, encoding_type, sort_position FROM projection_columns GROUP BY table_schema, table_name, table_column_name, data_type, encoding_type, sort_position ORDER BY sort_position DESC"
                 }
-                
+
                 metadata_file = f"{base_filename}_metadata.json"
                 with open(metadata_file, 'w') as f:
                     json.dump(metadata, f, indent=2)
                 temp_files.append(metadata_file)
-                
+
                 # Create ZIP archive silently
                 archive_name = f"../Archive/{base_filename}_backup.zip"
-                
+
                 if extractor.create_archive_silent(temp_files, archive_name):
                     print(f"\n✓ Archive created: {archive_name}")
                     print(f"✅ Backup archive created successfully inside Archive Directory !")
-                    
+
                     # Clean up temporary files silently
                     extractor.cleanup_temp_files_silent(temp_files)
                 else:
                     print(f"\n✗ Failed to create backup archive")
-        
+
         finally:
             extractor.disconnect()
-            
+
         print(f"\n" + "="*60)
         print("    PROCESS COMPLETED")
         print("="*60)
-            
+
     except KeyboardInterrupt:
         print(f"\n\n⚠ Process interrupted by user")
     except Exception as e:

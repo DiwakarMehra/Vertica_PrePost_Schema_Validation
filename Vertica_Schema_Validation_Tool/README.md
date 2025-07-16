@@ -22,13 +22,13 @@ Vertica Schema Pre/Post Validation Tool is an easy to use tool that compare the 
 
 #### How to use :
 
-Run the pre/post validation with below command.
+Run the pre/post validation with below command. (On Conductor VM)
 
 1. Untar the Tool.
    # tar -xvf Vertica_Schema_Validation_Tool.tgz
 
 2. Go inside the newly created directroy
-   # cd Vertica_Schema_Validation_Tool
+   # cd Vertica_Schema_Validation_Tool/src
 
 3. Run the Tool
    # python main.py
