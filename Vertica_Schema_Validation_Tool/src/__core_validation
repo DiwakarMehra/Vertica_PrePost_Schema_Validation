@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+Enhanced Vertica Schema File Comparison Tool
+Auto-discovers Pre and Post schema files and provides interactive selection
+Compares pre-upgrade and post-upgrade schema files and generates detailed reports
+"""
+
+import pandas as pd
+import time
+import json
+import csv
+import argparse
+import sys
+import glob
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Tuple, Set, Any
+import os
+
+
+class SchemaFileComparator:
+    def __init__(self):
+        """Initialize the schema file comparator"""
+        self.pre_upgrade_data = []
+        self.post_upgrade_data = []
+        self.comparison_results = {}
+
+    def discover_schema_files(self) -> Tuple[List[str], List[str]]:
+        """Discover Pre and Post schema files in current working directory"""
+        current_dir = Path.cwd().parent / "Reports"
+
+        # Find Pre files
+        pre_patterns = ['vertica_schema_Pre_*.csv', 'vertica_schema_pre_*.csv', '*_Pre_*.csv', '*_pre_*.csv']
+        pre_files = []
+        for pattern in pre_patterns:
+            pre_files.extend(glob.glob(str(current_dir / pattern)))
+
+        # Find Post files
+        post_patterns = ['vertica_schema_Post_*.csv', 'vertica_schema_post_*.csv', '*_Post_*.csv', '*_post_*.csv']
+        post_files = []
+        for pattern in post_patterns:
+            post_files.extend(glob.glob(str(current_dir / pattern)))
+
+        # Remove duplicates and sort
+        pre_files = sorted(list(set(pre_files)))
+        post_files = sorted(list(set(post_files)))
+
+        return pre_files, post_files
+
+    def display_file_selection(self, files: List[str], file_type: str) -> str:
+        """Display files for selection and return selected file"""
+        if not files:
+            print(f"\nNo {file_type} files found in current directory!")
+            print(f"Expected pattern: vertica_schema_{file_type}_*")
+            return None
+
+        print(f"\n{file_type.upper()} FILES AVAILABLE:")
+        print("-" * 50)
+
+        for i, file_path in enumerate(files, 1):
+            file_name = Path(file_path).name
+            file_size = Path(file_path).stat().st_size
+            mod_time = datetime.fromtimestamp(Path(file_path).stat().st_mtime)
+            print(f"{i:2d}. {file_name}")
+            print(f"    Size: {file_size:,} bytes | Modified: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        while True:
+            try:
+                choice = input(f"\nSelect {file_type} file (1-{len(files)}): ").strip()
+                if choice.lower() in ['quit', 'exit', 'q']:
+                    return None
+
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(files):
+                    selected_file = files[choice_idx]
+                    print(f"Selected: {Path(selected_file).name}")
+                    return selected_file
+                else:
+                    print(f"Please enter a number between 1 and {len(files)}")
+            except ValueError:
+                print("Please enter a valid number")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled by user")
+                return None
+
+    def load_csv_file(self, file_path: str) -> List[Dict[str, Any]]:
+        """Load data from CSV file"""
+        try:
+            data = []
+            with open(file_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                data = list(reader)
+            print(f"Loaded {len(data)} records from CSV: {Path(file_path).name}")
+            return data
+        except Exception as e:
+            print(f"Error loading CSV file {file_path}: {str(e)}")
+            return []
+
+    def load_json_file(self, file_path: str) -> List[Dict[str, Any]]:
+        """Load data from JSON file"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+            print(f"Loaded {len(data)} records from JSON: {Path(file_path).name}")
+            return data
+        except Exception as e:
+            print(f"Error loading JSON file {file_path}: {str(e)}")
+            return []
+
+    def load_excel_file(self, file_path: str, sheet_name: str = None) -> List[Dict[str, Any]]:
+        """Load data from Excel file"""
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            data = df.to_dict('records')
+            print(f"Loaded {len(data)} records from Excel: {Path(file_path).name}")
+            return data
+        except Exception as e:
+            print(f"Error loading Excel file {file_path}: {str(e)}")
+            return []
+
+    def auto_detect_and_load(self, file_path: str) -> List[Dict[str, Any]]:
+        """Auto-detect file format and load data"""
+        file_path = Path(file_path)
+
+        if not file_path.exists():
+            print(f"File not found: {file_path}")
+            return []
+
+        suffix = file_path.suffix.lower()
+
+        if suffix == '.csv':
+            return self.load_csv_file(str(file_path))
+        elif suffix == '.json':
+            return self.load_json_file(str(file_path))
+        elif suffix in ['.xlsx', '.xls']:
+            return self.load_excel_file(str(file_path))
+        else:
+            print(f"Unsupported file format: {suffix}")
+            return []
+
+    def load_files(self, pre_upgrade_file: str, post_upgrade_file: str):
+        """Load both pre and post upgrade files"""
+        print(f"\nLoading pre-upgrade file: {Path(pre_upgrade_file).name}")
+        self.pre_upgrade_data = self.auto_detect_and_load(pre_upgrade_file)
+
+        print(f"Loading post-upgrade file: {Path(post_upgrade_file).name}")
+        self.post_upgrade_data = self.auto_detect_and_load(post_upgrade_file)
+
+        if not self.pre_upgrade_data:
+            print("Warning: No data loaded from pre-upgrade file")
+        if not self.post_upgrade_data:
+            print("Warning: No data loaded from post-upgrade file")
+
+    def create_comparison_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for comparison based on schema, table, and column"""
+        schema = str(record.get('table_schema', ''))
+        table = str(record.get('table_name', ''))
+        column = str(record.get('table_column_name', ''))
+        return f"{schema}|{table}|{column}"
+
+    def normalize_data(self, data: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Convert list of records to dictionary keyed by comparison key"""
+        normalized = {}
+        for record in data:
+            key = self.create_comparison_key(record)
+            normalized[key] = record
+        return normalized
+
+    def compare_schemas(self) -> Dict[str, Any]:
+        """Perform detailed comparison between pre and post upgrade schemas"""
+        print("\nPerforming schema comparison...")
+        time.sleep (3)
+
+        # Normalize data for comparison
+        pre_normalized = self.normalize_data(self.pre_upgrade_data)
+        post_normalized = self.normalize_data(self.post_upgrade_data)
+
+        pre_keys = set(pre_normalized.keys())
+        post_keys = set(post_normalized.keys())
+
+        # Find differences
+        removed_columns = pre_keys - post_keys
+        added_columns = post_keys - pre_keys
+        common_columns = pre_keys & post_keys
+
+        # Analyze changes in common columns
+        modified_columns = []
+        for key in common_columns:
+            pre_record = pre_normalized[key]
+            post_record = post_normalized[key]
+
+            changes = {}
+            for field in ['data_type', 'encoding_type', 'sort_position']:
+                pre_value = str(pre_record.get(field, ''))
+                post_value = str(post_record.get(field, ''))
+
+                if pre_value != post_value:
+                    changes[field] = {
+                        'pre': pre_value,
+                        'post': post_value
+                    }
+
+            if changes:
+                modified_columns.append({
+                    'key': key,
+                    'changes': changes,
+                    'pre_record': pre_record,
+                    'post_record': post_record
+                })
+
+        # Compile results
+        self.comparison_results = {
+            'summary': {
+                'pre_upgrade_count': len(self.pre_upgrade_data),
+                'post_upgrade_count': len(self.post_upgrade_data),
+                'removed_count': len(removed_columns),
+                'added_count': len(added_columns),
+                'modified_count': len(modified_columns),
+                'unchanged_count': len(common_columns) - len(modified_columns)
+            },
+            'removed_columns': list(removed_columns),
+            'added_columns': list(added_columns),
+            'modified_columns': modified_columns,
+            'pre_normalized': pre_normalized,
+            'post_normalized': post_normalized
+        }
+
+        print(f"\nComparison completed:")
+        print(f"  - Pre-upgrade records: {self.comparison_results['summary']['pre_upgrade_count']}")
+        print(f"  - Post-upgrade records: {self.comparison_results['summary']['post_upgrade_count']}")
+        print(f"  - Removed columns: {self.comparison_results['summary']['removed_count']}")
+        print(f"  - Added columns: {self.comparison_results['summary']['added_count']}")
+        print(f"  - Modified columns: {self.comparison_results['summary']['modified_count']}")
+        print(f"  - Unchanged columns: {self.comparison_results['summary']['unchanged_count']}")
+
+        return self.comparison_results
+
+    def generate_text_report(self, output_file: str):
+        """Generate a detailed text report"""
+        if not self.comparison_results:
+            print("No comparison results available. Run compare_schemas() first.")
+            return
+
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write("VERTICA SCHEMA COMPARISON REPORT\n")
+                f.write("=" * 60 + "\n")
+                f.write(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+                # Summary
+                summary = self.comparison_results['summary']
+                f.write("SUMMARY\n")
+                f.write("-" * 20 + "\n")
+                f.write(f"Pre-upgrade records:  {summary['pre_upgrade_count']}\n")
+                f.write(f"Post-upgrade records: {summary['post_upgrade_count']}\n")
+                f.write(f"Removed columns:      {summary['removed_count']}\n")
+                f.write(f"Added columns:        {summary['added_count']}\n")
+                f.write(f"Modified columns:     {summary['modified_count']}\n")
+                f.write(f"Unchanged columns:    {summary['unchanged_count']}\n\n")
+
+                # Removed columns
+                f.write("REMOVED COLUMNS\n")
+                f.write("-" * 20 + "\n")
+                if self.comparison_results['removed_columns']:
+                    for col in sorted(self.comparison_results['removed_columns']):
+                        schema, table, column = col.split('|')
+                        f.write(f"  - {schema}.{table}.{column}\n")
+                        # Add details from pre-upgrade
+                        pre_record = self.comparison_results['pre_normalized'][col]
+                        f.write(f"    Type: {pre_record.get('data_type', 'N/A')}, "
+                               f"Encoding: {pre_record.get('encoding_type', 'N/A')}, "
+                               f"Sort Position: {pre_record.get('sort_position', 'N/A')}\n")
+                else:
+                    f.write("  No columns removed\n")
+                f.write("\n")
+
+                # Added columns
+                f.write("ADDED COLUMNS\n")
+                f.write("-" * 20 + "\n")
+                if self.comparison_results['added_columns']:
+                    for col in sorted(self.comparison_results['added_columns']):
+                        schema, table, column = col.split('|')
+                        f.write(f"  + {schema}.{table}.{column}\n")
+                        # Add details from post-upgrade
+                        post_record = self.comparison_results['post_normalized'][col]
+                        f.write(f"    Type: {post_record.get('data_type', 'N/A')}, "
+                               f"Encoding: {post_record.get('encoding_type', 'N/A')}, "
+                               f"Sort Position: {post_record.get('sort_position', 'N/A')}\n")
+                else:
+                    f.write("  No columns added\n")
+                f.write("\n")
+
+                # Modified columns
+                f.write("MODIFIED COLUMNS\n")
+                f.write("-" * 20 + "\n")
+                if self.comparison_results['modified_columns']:
+                    for mod in self.comparison_results['modified_columns']:
+                        schema, table, column = mod['key'].split('|')
+                        f.write(f"  ~ {schema}.{table}.{column}\n")
+                        for field, change in mod['changes'].items():
+                            f.write(f"    {field}: '{change['pre']}' -> '{change['post']}'\n")
+                        f.write("\n")
+                else:
+                    f.write("  No columns modified\n")
+
+            print(f"Text report saved to: {output_file}")
+
+        except Exception as e:
+            print(f"Error generating text report: {str(e)}")
+
+    def generate_excel_report(self, output_file: str):
+        """Generate a detailed Excel report with multiple sheets"""
+        if not self.comparison_results:
+            print("No comparison results available. Run compare_schemas() first.")
+            return
+
+        try:
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                # Summary sheet
+                summary_data = []
+                for key, value in self.comparison_results['summary'].items():
+                    summary_data.append({'Metric': key.replace('_', ' ').title(), 'Count': value})
+
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+                # Removed columns sheet
+                if self.comparison_results['removed_columns']:
+                    removed_data = []
+                    for col in self.comparison_results['removed_columns']:
+                        record = self.comparison_results['pre_normalized'][col]
+                        removed_data.append(record)
+
+                    removed_df = pd.DataFrame(removed_data)
+                    removed_df.to_excel(writer, sheet_name='Removed Columns', index=False)
+
+                # Added columns sheet
+                if self.comparison_results['added_columns']:
+                    added_data = []
+                    for col in self.comparison_results['added_columns']:
+                        record = self.comparison_results['post_normalized'][col]
+                        added_data.append(record)
+
+                    added_df = pd.DataFrame(added_data)
+                    added_df.to_excel(writer, sheet_name='Added Columns', index=False)
+
+                # Modified columns sheet
+                if self.comparison_results['modified_columns']:
+                    modified_data = []
+                    for mod in self.comparison_results['modified_columns']:
+                        row = {}
+                        pre_record = mod['pre_record']
+                        post_record = mod['post_record']
+
+                        # Add basic info
+                        row['table_schema'] = pre_record.get('table_schema')
+                        row['table_name'] = pre_record.get('table_name')
+                        row['table_column_name'] = pre_record.get('table_column_name')
+
+                        # Add pre/post values for changed fields
+                        for field, change in mod['changes'].items():
+                            row[f'{field}_before'] = change['pre']
+                            row[f'{field}_after'] = change['post']
+
+                        modified_data.append(row)
+
+                    modified_df = pd.DataFrame(modified_data)
+                    modified_df.to_excel(writer, sheet_name='Modified Columns', index=False)
+
+                # Full comparison sheet
+                comparison_data = []
+                all_keys = set(self.comparison_results['pre_normalized'].keys()) | set(self.comparison_results['post_normalized'].keys())
+
+                for key in sorted(all_keys):
+                    schema, table, column = key.split('|')
+                    row = {
+                        'table_schema': schema,
+                        'table_name': table,
+                        'table_column_name': column,
+                        'status': 'Unchanged'
+                    }
+
+                    if key in self.comparison_results['removed_columns']:
+                        row['status'] = 'Removed'
+                        pre_record = self.comparison_results['pre_normalized'][key]
+                        row.update({f'pre_{k}': v for k, v in pre_record.items()})
+                    elif key in self.comparison_results['added_columns']:
+                        row['status'] = 'Added'
+                        post_record = self.comparison_results['post_normalized'][key]
+                        row.update({f'post_{k}': v for k, v in post_record.items()})
+                    else:
+                        # Check if modified
+                        for mod in self.comparison_results['modified_columns']:
+                            if mod['key'] == key:
+                                row['status'] = 'Modified'
+                                break
+
+                        pre_record = self.comparison_results['pre_normalized'][key]
+                        post_record = self.comparison_results['post_normalized'][key]
+                        row.update({f'pre_{k}': v for k, v in pre_record.items()})
+                        row.update({f'post_{k}': v for k, v in post_record.items()})
+
+                    comparison_data.append(row)
+
+                comparison_df = pd.DataFrame(comparison_data)
+                comparison_df.to_excel(writer, sheet_name='Full Comparison', index=False)
+
+            print(f"Excel report saved to: {output_file}")
+
+        except Exception as e:
+            print(f"Error generating Excel report: {str(e)}")
+
+    def generate_csv_reports(self, output_prefix: str):
+        """Generate separate CSV files for different comparison aspects"""
+        if not self.comparison_results:
+            print("No comparison results available. Run compare_schemas() first.")
+            return
+
+        try:
+            # Summary CSV
+            summary_data = []
+            for key, value in self.comparison_results['summary'].items():
+                summary_data.append({'Metric': key.replace('_', ' ').title(), 'Count': value})
+
+            summary_df = pd.DataFrame(summary_data)
+            summary_file = f"{output_prefix}_summary.csv"
+            summary_df.to_csv(summary_file, index=False)
+            print(f"Summary CSV saved to: {summary_file}")
+
+            # Removed columns CSV
+            if self.comparison_results['removed_columns']:
+                removed_data = [self.comparison_results['pre_normalized'][col]
+                              for col in self.comparison_results['removed_columns']]
+                removed_df = pd.DataFrame(removed_data)
+                removed_file = f"{output_prefix}_removed.csv"
+                removed_df.to_csv(removed_file, index=False)
+                print(f"Removed columns CSV saved to: {removed_file}")
+
+            # Added columns CSV
+            if self.comparison_results['added_columns']:
+                added_data = [self.comparison_results['post_normalized'][col]
+                            for col in self.comparison_results['added_columns']]
+                added_df = pd.DataFrame(added_data)
+                added_file = f"{output_prefix}_added.csv"
+                added_df.to_csv(added_file, index=False)
+                print(f"Added columns CSV saved to: {added_file}")
+
+            # Modified columns CSV
+            if self.comparison_results['modified_columns']:
+                modified_data = []
+                for mod in self.comparison_results['modified_columns']:
+                    row = mod['pre_record'].copy()
+                    row['changes'] = ', '.join([f"{k}: {v['pre']} -> {v['post']}"
+                                              for k, v in mod['changes'].items()])
+                    modified_data.append(row)
+
+                modified_df = pd.DataFrame(modified_data)
+                modified_file = f"{output_prefix}_modified.csv"
+                modified_df.to_csv(modified_file, index=False)
+                print(f"Modified columns CSV saved to: {modified_file}")
+
+        except Exception as e:
+            print(f"Error generating CSV reports: {str(e)}")
+
+    def interactive_mode(self):
+        """Run the tool in interactive mode with file discovery"""
+        print("=" * 60)
+        print("VERTICA SCHEMA COMPARISON TOOL")
+        print("=" * 60)
+        print(f"Scanning current directory: {Path.cwd()}")
+
+        # Discover files
+        pre_files, post_files = self.discover_schema_files()
+
+        # Select Pre file
+        pre_file = self.display_file_selection(pre_files, "Pre")
+        if not pre_file:
+            print("No Pre file selected. Exiting.")
+            return False
+
+        # Select Post file
+        post_file = self.display_file_selection(post_files, "Post")
+        if not post_file:
+            print("No Post file selected. Exiting.")
+            return False
+
+        # Load and compare files
+        self.load_files(pre_file, post_file)
+
+        if not self.pre_upgrade_data and not self.post_upgrade_data:
+            print("Error: No data loaded from either file")
+            return False
+
+        # Perform comparison
+        self.compare_schemas()
+
+        # Generate reports
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_prefix = f"schema_comparison_{timestamp}"
+
+        print(f"\nGenerating comparison reports...")
+        self.generate_text_report(f"../Reports/{output_prefix}.txt")
+        #self.generate_excel_report(f"{output_prefix}.xlsx")
+        #self.generate_csv_reports(output_prefix)
+
+        print(f"\n" + "=" * 60)
+        print("COMPARISON COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+        print("Generated files:")
+        print(f"  - Text report: {output_prefix}.txt")
+        #print(f"  - Excel report: {output_prefix}.xlsx")
+        #print(f"  - CSV reports: {output_prefix}_*.csv")
+
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Enhanced Vertica Schema File Comparison Tool')
+    parser.add_argument('--pre-file', help='Pre-upgrade schema file path (optional in interactive mode)')
+    parser.add_argument('--post-file', help='Post-upgrade schema file path (optional in interactive mode)')
+    parser.add_argument('--output-format', choices=['text', 'excel', 'csv', 'all'], default='text',
+                       help='Output format for comparison report (default: text)')
+    parser.add_argument('--output-prefix', default='schema_comparison',
+                       help='Output file prefix (default: schema_comparison)')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                       help='Run in interactive mode with automatic file discovery')
+
+    args = parser.parse_args()
+
+    # Create comparator instance
+    comparator = SchemaFileComparator()
+
+    # Run in interactive mode if requested or no files specified
+    if args.interactive or (not args.pre_file and not args.post_file):
+        return comparator.interactive_mode()
+
+    # Validate input files exist (command line mode)
+    if not args.pre_file or not args.post_file:
+        print("Error: Both --pre-file and --post-file are required in non-interactive mode")
+        print("Use --interactive or -i flag for interactive file selection")
+        sys.exit(1)
+
+    if not Path(args.pre_file).exists():
+        print(f"Error: Pre-upgrade file not found: {args.pre_file}")
+        sys.exit(1)
+
+    if not Path(args.post_file).exists():
+        print(f"Error: Post-upgrade file not found: {args.post_file}")
+        sys.exit(1)
+
+    # Load files and perform comparison
+    comparator.load_files(args.pre_file, args.post_file)
+
+    if not comparator.pre_upgrade_data and not comparator.post_upgrade_data:
+        print("Error: No data loaded from either file")
+        sys.exit(1)
+
+    # Perform comparison
+    comparator.compare_schemas()
+
+    # Generate reports
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if args.output_format in ['text', 'all']:
+        text_file = f"{args.output_prefix}_{timestamp}.txt"
+        comparator.generate_text_report(text_file)
+
+    if args.output_format in ['excel', 'all']:
+        excel_file = f"{args.output_prefix}_{timestamp}.xlsx"
+        comparator.generate_excel_report(excel_file)
+
+    if args.output_format in ['csv', 'all']:
+        csv_prefix = f"{args.output_prefix}_{timestamp}"
+        comparator.generate_csv_reports(csv_prefix)
+
+    print(f"\nSchema comparison completed successfully!")
+    print(f"Check the generated report files for detailed analysis.")
+
+
+if __name__ == "__main__":
+    # Run in interactive mode by default if no arguments provided
+    if len(sys.argv) == 1:
+        print("Starting in interactive mode...")
+        comparator = SchemaFileComparator()
+        comparator.interactive_mode()
+    else:
+        main()
+

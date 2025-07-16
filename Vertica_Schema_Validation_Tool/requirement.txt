@@ -1,0 +1,4 @@
+vertica_python
+# pip install vertica_python
+pandas
+# pip install pandas

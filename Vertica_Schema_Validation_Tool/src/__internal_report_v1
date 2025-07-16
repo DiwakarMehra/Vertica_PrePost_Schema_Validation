@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Vertica Pre & Post-upgrade Schema Comparison Program
+Interactive version with comparison and backup functionality
+"""
+
+import vertica_python
+import csv
+import json
+import pandas as pd
+from datetime import datetime
+import os
+import sys
+import zipfile
+import tarfile
+import pickle
+from typing import List, Dict, Any
+import argparse
+import getpass
+import subprocess
+import platform
+import warnings
+
+# Suppress vertica_python TLS warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="vertica_python")
+
+
+class VerticaSchemaExtractor:
+    def __init__(self, host: str, port: int, username: str, password: str, database: str):
+        """
+        Initialize Vertica connection parameters
+        
+        Args:
+            host: Vertica server hostname
+            port: Vertica server port
+            username: Database username
+            password: Database password
+            database: Database name
+        """
+        self.connection_info = {
+            'host': host,
+            'port': port,
+            'user': username,
+            'password': password,
+            'database': database,
+            'read_timeout': 600,
+            'unicode_error': 'strict',
+            'tlsmode': 'disable'  # Disable TLS to avoid warnings
+        }
+        self.connection = None
+    
+    def connect(self):
+        """Establish connection to Vertica database"""
+        try:
+            self.connection = vertica_python.connect(**self.connection_info)
+            #print(f"✓ Connected to Vertica database: {self.connection_info['database']}")
+            return True
+        except Exception as e:
+            print(f"✗ Error connecting to Vertica: {str(e)}")
+            return False
+    
+    def disconnect(self):
+        """Close database connection"""
+        if self.connection:
+            self.connection.close()
+            print("✓ Disconnected from Vertica database")
+    
+    def execute_schema_query(self, env_version: str = "13.3", table_pattern: str = "CDR_S1AP") -> List[Dict[str, Any]]:
+        """
+        Execute the schema comparison query
+        
+        Args:
+            env_version: Environment version identifier (not used in final query)
+            table_pattern: Table name pattern (not used in final query)
+            
+        Returns:
+            List of dictionaries containing query results
+        """
+        query = """
+        SELECT table_schema,
+               table_name,
+               table_column_name,
+               data_type,
+               encoding_type,
+               sort_position 
+        FROM projection_columns 
+        GROUP BY table_schema, table_name, table_column_name, data_type, encoding_type, sort_position 
+        ORDER BY sort_position DESC
+        """
+        
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(query)
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Fetch all results
+            results = cursor.fetchall()
+            
+            # Convert to list of dictionaries
+            schema_data = []
+            for row in results:
+                schema_data.append(dict(zip(columns, row)))
+            
+            cursor.close()
+            print(f"✓ Retrieved {len(schema_data)} schema records")
+            return schema_data
+            
+        except Exception as e:
+            print(f"✗ Error executing query: {str(e)}")
+            return []
+    
+    def save_to_csv(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
+        """Save schema data to CSV file"""
+        if not data:
+            if not silent:
+                print("⚠ No data to save")
+            return False
+        
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = data[0].keys()
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                writer.writerows(data)
+            
+            if not silent:
+                print(f"✓ Schema data saved to CSV: {filename}")
+            return True
+            
+        except Exception as e:
+            if not silent:
+                print(f"✗ Error saving to CSV: {str(e)}")
+            return False
+    
+    def save_to_json(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
+        """Save schema data to JSON file"""
+        if not data:
+            if not silent:
+                print("⚠ No data to save")
+            return False
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as jsonfile:
+                json.dump(data, jsonfile, indent=2, default=str)
+            
+            if not silent:
+                print(f"✓ Schema data saved to JSON: {filename}")
+            return True
+            
+        except Exception as e:
+            if not silent:
+                print(f"✗ Error saving to JSON: {str(e)}")
+            return False
+    
+    def save_to_excel(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
+        """Save schema data to Excel file"""
+        if not data:
+            if not silent:
+                print("⚠ No data to save")
+            return False
+        
+        try:
+            df = pd.DataFrame(data)
+            df.to_excel(filename, index=False, engine='openpyxl')
+            if not silent:
+                print(f"✓ Schema data saved to Excel: {filename}")
+            return True
+            
+        except Exception as e:
+            if not silent:
+                print(f"✗ Error saving to Excel: {str(e)}")
+            return False
+    
+    def save_to_pickle(self, data: List[Dict[str, Any]], filename: str, silent: bool = False):
+        """Save schema data to pickle file for backup purposes"""
+        if not data:
+            if not silent:
+                print("⚠ No data to save")
+            return False
+        
+        try:
+            with open(filename, 'wb') as picklefile:
+                pickle.dump(data, picklefile)
+            
+            if not silent:
+                print(f"✓ Schema data saved to Pickle: {filename}")
+            return True
+            
+        except Exception as e:
+            if not silent:
+                print(f"✗ Error saving to Pickle: {str(e)}")
+            return False
+    
+    def create_archive(self, files_to_archive: List[str], archive_name: str, archive_type: str = "zip"):
+        """
+        Create archive with specified files
+        
+        Args:
+            files_to_archive: List of file paths to include in archive
+            archive_name: Name of the archive file
+            archive_type: Type of archive ('zip' or 'tar')
+        """
+        try:
+            if archive_type.lower() == "zip":
+                with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file_path in files_to_archive:
+                        if os.path.exists(file_path):
+                            zipf.write(file_path, os.path.basename(file_path))
+                            print(f"  ✓ Added {file_path} to archive")
+                        else:
+                            print(f"  ⚠ File not found: {file_path}")
+            
+            elif archive_type.lower() == "tar":
+                with tarfile.open(archive_name, 'w:gz') as tarf:
+                    for file_path in files_to_archive:
+                        if os.path.exists(file_path):
+                            tarf.add(file_path, arcname=os.path.basename(file_path))
+                            print(f"  ✓ Added {file_path} to archive")
+                        else:
+                            print(f"  ⚠ File not found: {file_path}")
+            
+            print(f"✓ Archive created: {archive_name}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error creating archive: {str(e)}")
+            return False
+    
+    def create_archive_silent(self, files_to_archive: List[str], archive_name: str):
+        """
+        Create ZIP archive silently without verbose output
+        
+        Args:
+            files_to_archive: List of file paths to include in archive
+            archive_name: Name of the archive file
+        """
+        try:
+            with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in files_to_archive:
+                    if os.path.exists(file_path):
+                        zipf.write(file_path, os.path.basename(file_path))
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error creating archive: {str(e)}")
+            return False
+    
+    def cleanup_temp_files_silent(self, files_to_delete: List[str]):
+        """Clean up temporary files silently"""
+        for file_path in files_to_delete:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass  # Silent cleanup - ignore errors
+
+
+def ping_host(hostname):
+    """
+    Ping the hostname to check connectivity
+    
+    Args:
+        hostname: The hostname to ping
+        
+    Returns:
+        bool: True if ping successful, False otherwise
+    """
+    try:
+        # Determine ping command based on OS
+        if platform.system().lower() == "windows":
+            cmd = ["ping", "-n", "3", hostname]
+        else:
+            cmd = ["ping", "-c", "3", hostname]
+        
+        # Execute ping command
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+        
+    except Exception as e:
+        print(f"⚠ Error during ping: {str(e)}")
+        return False
+
+
+def get_hostname():
+    """
+    Interactive function to get hostname with ping verification
+    
+    Returns:
+        str: Verified hostname or None if user chooses to exit
+    """
+    print("\n" + "="*60)
+    print("    VERTICA SCHEMA EXTRACTION TOOL")
+    print("="*60)
+    
+    while True:
+        print("\n" + "-"*40)
+        print("Connection Setup:")
+        print("-"*40)
+        
+        hostname = input("Enter Vertica hostname/IP: ").strip()
+        
+        if not hostname:
+            print("⚠ Hostname cannot be empty. Please try again.")
+            continue
+        
+        print(f"\n🔍 Checking connectivity to {hostname}...")
+        
+        if ping_host(hostname):
+            print("✓ Connection OK")
+            return hostname
+        else:
+            print("✗ Vertica Not Available")
+            print("\nOptions:")
+            print("1. Try another hostname")
+            print("2. Exit")
+            
+            while True:
+                try:
+                    choice = int(input("\nEnter your choice (1 or 2): ").strip())
+                    if choice == 1:
+                        break
+                    elif choice == 2:
+                        return None
+                    else:
+                        print("Please enter either 1 or 2")
+                except ValueError:
+                    print("Please enter a valid number (1 or 2)")
+
+
+def get_user_input():
+    """Interactive function to get user preferences"""
+    
+    # Get hostname with ping verification
+    hostname = get_hostname()
+    if not hostname:
+        print("\n👋 Goodbye!")
+        return None
+    
+    # Fixed connection parameters
+    username = "dbadmin"
+    password = "dbadmin"
+    port = 5433
+    database = "vdb"
+    
+    # Fixed query parameters
+    env_version = "13.3"
+    table_pattern = "CDR_S1AP"
+    
+    # Get purpose
+    print("\n" + "-"*40)
+    print("Select the purpose to run the program:")
+    print("-"*40)
+    print("1. Create Report for comparison")
+    print("2. Create Report for Backup")
+    
+    while True:
+        try:
+            purpose = int(input("\nEnter your choice (1 or 2): ").strip())
+            if purpose in [1, 2]:
+                break
+            else:
+                print("Please enter either 1 or 2")
+        except ValueError:
+            print("Please enter a valid number (1 or 2)")
+    
+    # Fixed output format - CSV only for comparison, ZIP archive for backup
+    if purpose == 1:  # Comparison
+        output_format = 'csv'
+        archive_format = None
+    else:  # Backup - automatically use ZIP format
+        output_format = 'backup'
+        archive_format = 'zip'
+    
+    return {
+        'purpose': purpose,
+        'host': hostname,
+        'port': port,
+        'username': username,
+        'password': password,
+        'database': database,
+        'env_version': env_version,
+        'table_pattern': table_pattern,
+        'output_format': output_format,
+        'archive_format': archive_format if purpose == 2 else None
+    }
+
+
+def main():
+    """Main interactive function"""
+    try:
+        # Get user input
+        config = get_user_input()
+        
+        # Check if user chose to exit
+        if config is None:
+            return
+        
+        print("\n" + "="*60)
+        print("    PROCESSING...")
+        print("="*60)
+        
+        # Create schema extractor
+        extractor = VerticaSchemaExtractor(
+            host=config['host'],
+            port=config['port'],
+            username=config['username'],
+            password=config['password'],
+            database=config['database']
+        )
+        
+        # Connect to database
+        if not extractor.connect():
+            print("\n✗ Failed to connect to database. Exiting...")
+            return
+        
+        try:
+            # Remove verbose processing messages for backup
+            if config['purpose'] == 1:  # Only show for comparison
+                print(f"\n🔍 Executing schema query...")
+            schema_data = extractor.execute_schema_query(config['env_version'], config['table_pattern'])
+            
+            if not schema_data:
+                print("✗ No schema data retrieved. Exiting...")
+                return
+            
+            # Generate timestamp for filenames
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            base_filename = f"vertica_schema_Pre_{timestamp}"
+            
+            if config['purpose'] == 1:  # Only show for comparison
+                print(f"\n📊 Processing {len(schema_data)} records...")
+            
+            if config['purpose'] == 1:  # Comparison Report
+                print(f"\n📄 Creating comparison report in CSV format...")
+                
+                csv_file = f"../Reports/{base_filename}.csv"
+                if extractor.save_to_csv(schema_data, csv_file):
+                    print(f"\n✅ Comparison report created successfully in Reports Directory !")
+                    print(f"📁 File created: {csv_file}")
+                else:
+                    print(f"\n✗ Failed to create comparison report")
+            
+            else:  # Backup Report
+                print(f"\n💾 Creating backup archive in ZIP format...")
+                
+                # Create files in multiple formats for comprehensive backup
+                temp_files = []
+                
+                csv_file = f"{base_filename}.csv"
+                json_file = f"{base_filename}.json"
+                pickle_file = f"{base_filename}.pkl"
+                
+                # Save files silently (without print statements)
+                if extractor.save_to_csv(schema_data, csv_file, silent=True):
+                    temp_files.append(csv_file)
+                
+                if extractor.save_to_json(schema_data, json_file, silent=True):
+                    temp_files.append(json_file)
+                
+                if extractor.save_to_pickle(schema_data, pickle_file, silent=True):
+                    temp_files.append(pickle_file)
+                
+                # Create metadata file with query and connection info
+                metadata = {
+                    'extraction_timestamp': datetime.now().isoformat(),
+                    'database_host': config['host'],
+                    'database_name': config['database'],
+                    'environment_version': config['env_version'],
+                    'table_pattern': config['table_pattern'],
+                    'records_count': len(schema_data),
+                    'query_used': "SELECT table_schema, table_name, table_column_name, data_type, encoding_type, sort_position FROM projection_columns GROUP BY table_schema, table_name, table_column_name, data_type, encoding_type, sort_position ORDER BY sort_position DESC"
+                }
+                
+                metadata_file = f"{base_filename}_metadata.json"
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                temp_files.append(metadata_file)
+                
+                # Create ZIP archive silently
+                archive_name = f"../Archive/{base_filename}_backup.zip"
+                
+                if extractor.create_archive_silent(temp_files, archive_name):
+                    print(f"\n✓ Archive created: {archive_name}")
+                    print(f"✅ Backup archive created successfully!")
+                    
+                    # Clean up temporary files silently
+                    extractor.cleanup_temp_files_silent(temp_files)
+                else:
+                    print(f"\n✗ Failed to create backup archive")
+        
+        finally:
+            extractor.disconnect()
+            
+        print(f"\n" + "="*60)
+        print("    PROCESS COMPLETED")
+        print("="*60)
+            
+    except KeyboardInterrupt:
+        print(f"\n\n⚠ Process interrupted by user")
+    except Exception as e:
+        print(f"\n✗ Unexpected error: {str(e)}")
+
+
+if __name__ == "__main__":
+    # Check if running with command line arguments
+    if len(sys.argv) > 1:
+        print("Command line mode detected. Use interactive mode by running without arguments.")
+        print("For interactive mode, run: python vertica_schema_comparison.py")
+    else:
+        main()
