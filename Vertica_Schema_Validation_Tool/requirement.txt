@@ -1,4 +1,12 @@
 vertica_python
-# pip install vertica_python
+python-dateutil
+pytz
+tzdata
+numpy
 pandas
-# pip install pandas
+# -----------------------
+# pip install vertica_python-1.4.0-py3-none-any.whl
+# pip install pandas-2.3.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# pip install numpy-2.3.1-cp311-cp311-manylinux_2_28_x86_64.whl
+# pip install pytz-2025.2-py2.py3-none-any.whl
+# pip install tzdata-2025.2-py2.py3-none-any.whl

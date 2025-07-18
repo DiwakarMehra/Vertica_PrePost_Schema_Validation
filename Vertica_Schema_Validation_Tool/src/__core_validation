@@ -3,6 +3,7 @@
 Enhanced Vertica Schema File Comparison Tool
 Auto-discovers Pre and Post schema files and provides interactive selection
 Compares pre-upgrade and post-upgrade schema files and generates detailed reports
+Now includes User/Resource Pool, Configuration Parameters, Vertica Libraries, and KVM/OS Configuration comparison
 """
 
 import pandas as pd
@@ -16,13 +17,26 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Set, Any
 import os
+import re
 
 
 class SchemaFileComparator:
     def __init__(self):
         """Initialize the schema file comparator"""
-        self.pre_upgrade_data = []
-        self.post_upgrade_data = []
+        self.pre_upgrade_data = {
+            'projection_columns': [],
+            'users': [],
+            'configuration_parameters': [],
+            'vertica_libraries': [],
+            'kvm_os_config': []
+        }
+        self.post_upgrade_data = {
+            'projection_columns': [],
+            'users': [],
+            'configuration_parameters': [],
+            'vertica_libraries': [],
+            'kvm_os_config': []
+        }
         self.comparison_results = {}
 
     def discover_schema_files(self) -> Tuple[List[str], List[str]]:
@@ -30,13 +44,13 @@ class SchemaFileComparator:
         current_dir = Path.cwd().parent / "Reports"
 
         # Find Pre files
-        pre_patterns = ['vertica_schema_Pre_*.csv', 'vertica_schema_pre_*.csv', '*_Pre_*.csv', '*_pre_*.csv']
+        pre_patterns = ['vertica_schema_Pre_*.csv', 'vertica_schema_pre_*.csv', '*_Pre_*.csv', '*_pre_*.csv', 'Vertica_Pre_Validation_Report_*.csv']
         pre_files = []
         for pattern in pre_patterns:
             pre_files.extend(glob.glob(str(current_dir / pattern)))
 
         # Find Post files
-        post_patterns = ['vertica_schema_Post_*.csv', 'vertica_schema_post_*.csv', '*_Post_*.csv', '*_post_*.csv']
+        post_patterns = ['vertica_schema_Post_*.csv', 'vertica_schema_post_*.csv', '*_Post_*.csv', '*_post_*.csv', 'Vertica_Post_Validation_Report_*.csv']
         post_files = []
         for pattern in post_patterns:
             post_files.extend(glob.glob(str(current_dir / pattern)))
@@ -83,107 +97,184 @@ class SchemaFileComparator:
                 print("\nOperation cancelled by user")
                 return None
 
-    def load_csv_file(self, file_path: str) -> List[Dict[str, Any]]:
-        """Load data from CSV file"""
+    def parse_combined_csv(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Parse the combined CSV file with multiple sections"""
         try:
-            data = []
+            data = {
+                'projection_columns': [],
+                'users': [],
+                'configuration_parameters': [],
+                'vertica_libraries': [],
+                'kvm_os_config': []
+            }
+
+            current_section = None
+            current_headers = []
+            in_failed_checks = False
+            failed_checks = []
+
             with open(file_path, 'r', encoding='utf-8') as file:
-                reader = csv.DictReader(file)
-                data = list(reader)
-            print(f"Loaded {len(data)} records from CSV: {Path(file_path).name}")
+                reader = csv.reader(file)
+
+                for row in reader:
+                    # Skip empty rows
+                    if not row or not any(cell.strip() for cell in row):
+                        continue
+
+                    # Check for section headers
+                    if len(row) == 1 and row[0].strip():
+                        line = row[0].strip()
+                        if "Schema Projection Columns Details" in line:
+                            current_section = 'projection_columns'
+                            current_headers = []
+                            in_failed_checks = False
+                            continue
+                        elif "User / Resource Pool Details" in line:
+                            current_section = 'users'
+                            current_headers = []
+                            in_failed_checks = False
+                            continue
+                        elif "Vertica recommended configuration" in line:
+                            current_section = 'configuration_parameters'
+                            current_headers = []
+                            in_failed_checks = False
+                            continue
+                        elif "Vertica Libraries Details" in line:
+                            current_section = 'vertica_libraries'
+                            current_headers = []
+                            in_failed_checks = False
+                            continue
+                        elif "KVM/OS Level Configuration Details" in line:
+                            current_section = 'kvm_os_config'
+                            current_headers = []
+                            in_failed_checks = False
+                            continue
+                        elif "Failed Checks Details" in line and current_section == 'kvm_os_config':
+                            in_failed_checks = True
+                            continue
+
+                    # Skip section divider lines
+                    if len(row) == 1 and row[0].strip().startswith('-'):
+                        continue
+
+                    # Process data rows
+                    if current_section:
+                        if current_section == 'kvm_os_config' and in_failed_checks:
+                            # Process failed checks in KVM/OS section
+                            if len(row) > 0 and row[0].strip():
+                                failed_checks.append(row[0].strip())
+                        elif not current_headers:
+                            # This is the header row
+                            current_headers = [header.strip() for header in row if header.strip()]
+                        else:
+                            # This is a data row
+                            if current_section == 'vertica_libraries':
+                                # Special handling for libraries section - single column data
+                                if len(row) > 0 and row[0].strip():
+                                    record = {'lib_name': row[0].strip()}
+                                    data[current_section].append(record)
+                            elif current_section == 'kvm_os_config' and current_headers and current_headers[0] == 'Summary Status':
+                                # Handle KVM/OS summary section
+                                if len(row) >= 2 and row[0].strip() and row[1].strip():
+                                    record = {
+                                        'status': row[0].strip(),
+                                        'count': row[1].strip()
+                                    }
+                                    data[current_section].append(record)
+                            else:
+                                # Regular multi-column data
+                                if len(row) >= len(current_headers):
+                                    record = {}
+                                    for i, header in enumerate(current_headers):
+                                        record[header] = row[i].strip() if i < len(row) else ''
+                                    data[current_section].append(record)
+
+            # Add failed checks to KVM/OS data
+            if failed_checks:
+                for check in failed_checks:
+                    data['kvm_os_config'].append({
+                        'check_status': 'FAIL',
+                        'check_description': check
+                    })
+
+            print(f"Parsed combined CSV: {Path(file_path).name}")
+            print(f"  - Projection columns: {len(data['projection_columns'])}")
+            print(f"  - Users: {len(data['users'])}")
+            print(f"  - Configuration parameters: {len(data['configuration_parameters'])}")
+            print(f"  - Vertica libraries: {len(data['vertica_libraries'])}")
+            print(f"  - KVM/OS config items: {len(data['kvm_os_config'])}")
+
             return data
+
         except Exception as e:
-            print(f"Error loading CSV file {file_path}: {str(e)}")
-            return []
-
-    def load_json_file(self, file_path: str) -> List[Dict[str, Any]]:
-        """Load data from JSON file"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                data = json.load(file)
-            print(f"Loaded {len(data)} records from JSON: {Path(file_path).name}")
-            return data
-        except Exception as e:
-            print(f"Error loading JSON file {file_path}: {str(e)}")
-            return []
-
-    def load_excel_file(self, file_path: str, sheet_name: str = None) -> List[Dict[str, Any]]:
-        """Load data from Excel file"""
-        try:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
-            data = df.to_dict('records')
-            print(f"Loaded {len(data)} records from Excel: {Path(file_path).name}")
-            return data
-        except Exception as e:
-            print(f"Error loading Excel file {file_path}: {str(e)}")
-            return []
-
-    def auto_detect_and_load(self, file_path: str) -> List[Dict[str, Any]]:
-        """Auto-detect file format and load data"""
-        file_path = Path(file_path)
-
-        if not file_path.exists():
-            print(f"File not found: {file_path}")
-            return []
-
-        suffix = file_path.suffix.lower()
-
-        if suffix == '.csv':
-            return self.load_csv_file(str(file_path))
-        elif suffix == '.json':
-            return self.load_json_file(str(file_path))
-        elif suffix in ['.xlsx', '.xls']:
-            return self.load_excel_file(str(file_path))
-        else:
-            print(f"Unsupported file format: {suffix}")
-            return []
+            print(f"Error parsing combined CSV file {file_path}: {str(e)}")
+            return {
+                'projection_columns': [],
+                'users': [],
+                'configuration_parameters': [],
+                'vertica_libraries': [],
+                'kvm_os_config': []
+            }
 
     def load_files(self, pre_upgrade_file: str, post_upgrade_file: str):
         """Load both pre and post upgrade files"""
         print(f"\nLoading pre-upgrade file: {Path(pre_upgrade_file).name}")
-        self.pre_upgrade_data = self.auto_detect_and_load(pre_upgrade_file)
+        self.pre_upgrade_data = self.parse_combined_csv(pre_upgrade_file)
 
         print(f"Loading post-upgrade file: {Path(post_upgrade_file).name}")
-        self.post_upgrade_data = self.auto_detect_and_load(post_upgrade_file)
+        self.post_upgrade_data = self.parse_combined_csv(post_upgrade_file)
 
-        if not self.pre_upgrade_data:
-            print("Warning: No data loaded from pre-upgrade file")
-        if not self.post_upgrade_data:
-            print("Warning: No data loaded from post-upgrade file")
-
-    def create_comparison_key(self, record: Dict[str, Any]) -> str:
-        """Create a unique key for comparison based on schema, table, and column"""
+    def create_projection_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for projection comparison"""
         schema = str(record.get('table_schema', ''))
         table = str(record.get('table_name', ''))
         column = str(record.get('table_column_name', ''))
         return f"{schema}|{table}|{column}"
 
-    def normalize_data(self, data: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def create_user_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for user comparison"""
+        return str(record.get('user_name', ''))
+
+    def create_config_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for configuration comparison"""
+        node = str(record.get('node_name', ''))
+        param = str(record.get('parameter_name', ''))
+        return f"{node}|{param}"
+
+    def create_library_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for library comparison"""
+        return str(record.get('lib_name', ''))
+
+    def create_kvm_os_key(self, record: Dict[str, Any]) -> str:
+        """Create a unique key for KVM/OS comparison"""
+        if 'check_description' in record:
+            # For failed checks
+            return str(record.get('check_description', ''))
+        elif 'status' in record and 'count' in record:
+            # For summary status
+            return f"SUMMARY|{record['status']}"
+        return str(record)
+
+    def normalize_data(self, data: List[Dict[str, Any]], key_func) -> Dict[str, Dict[str, Any]]:
         """Convert list of records to dictionary keyed by comparison key"""
         normalized = {}
         for record in data:
-            key = self.create_comparison_key(record)
+            key = key_func(record)
             normalized[key] = record
         return normalized
 
-    def compare_schemas(self) -> Dict[str, Any]:
-        """Perform detailed comparison between pre and post upgrade schemas"""
-        print("\nPerforming schema comparison...")
-        time.sleep (3)
-
-        # Normalize data for comparison
-        pre_normalized = self.normalize_data(self.pre_upgrade_data)
-        post_normalized = self.normalize_data(self.post_upgrade_data)
+    def compare_projection_columns(self) -> Dict[str, Any]:
+        """Compare projection columns between pre and post upgrade"""
+        pre_normalized = self.normalize_data(self.pre_upgrade_data['projection_columns'], self.create_projection_key)
+        post_normalized = self.normalize_data(self.post_upgrade_data['projection_columns'], self.create_projection_key)
 
         pre_keys = set(pre_normalized.keys())
         post_keys = set(post_normalized.keys())
 
-        # Find differences
         removed_columns = pre_keys - post_keys
         added_columns = post_keys - pre_keys
         common_columns = pre_keys & post_keys
 
-        # Analyze changes in common columns
         modified_columns = []
         for key in common_columns:
             pre_record = pre_normalized[key]
@@ -208,266 +299,461 @@ class SchemaFileComparator:
                     'post_record': post_record
                 })
 
-        # Compile results
-        self.comparison_results = {
+        return {
             'summary': {
-                'pre_upgrade_count': len(self.pre_upgrade_data),
-                'post_upgrade_count': len(self.post_upgrade_data),
+                'pre_count': len(self.pre_upgrade_data['projection_columns']),
+                'post_count': len(self.post_upgrade_data['projection_columns']),
                 'removed_count': len(removed_columns),
                 'added_count': len(added_columns),
                 'modified_count': len(modified_columns),
                 'unchanged_count': len(common_columns) - len(modified_columns)
             },
-            'removed_columns': list(removed_columns),
-            'added_columns': list(added_columns),
-            'modified_columns': modified_columns,
+            'removed': list(removed_columns),
+            'added': list(added_columns),
+            'modified': modified_columns,
             'pre_normalized': pre_normalized,
             'post_normalized': post_normalized
         }
 
+    def compare_users(self) -> Dict[str, Any]:
+        """Compare users and resource pools between pre and post upgrade"""
+        pre_normalized = self.normalize_data(self.pre_upgrade_data['users'], self.create_user_key)
+        post_normalized = self.normalize_data(self.post_upgrade_data['users'], self.create_user_key)
+
+        pre_keys = set(pre_normalized.keys())
+        post_keys = set(post_normalized.keys())
+
+        removed_users = pre_keys - post_keys
+        added_users = post_keys - pre_keys
+        common_users = pre_keys & post_keys
+
+        modified_users = []
+        for key in common_users:
+            pre_record = pre_normalized[key]
+            post_record = post_normalized[key]
+
+            changes = {}
+            for field in ['search_path', 'resource_pool']:
+                pre_value = str(pre_record.get(field, ''))
+                post_value = str(post_record.get(field, ''))
+
+                if pre_value != post_value:
+                    changes[field] = {
+                        'pre': pre_value,
+                        'post': post_value
+                    }
+
+            if changes:
+                modified_users.append({
+                    'key': key,
+                    'changes': changes,
+                    'pre_record': pre_record,
+                    'post_record': post_record
+                })
+
+        return {
+            'summary': {
+                'pre_count': len(self.pre_upgrade_data['users']),
+                'post_count': len(self.post_upgrade_data['users']),
+                'removed_count': len(removed_users),
+                'added_count': len(added_users),
+                'modified_count': len(modified_users),
+                'unchanged_count': len(common_users) - len(modified_users)
+            },
+            'removed': list(removed_users),
+            'added': list(added_users),
+            'modified': modified_users,
+            'pre_normalized': pre_normalized,
+            'post_normalized': post_normalized
+        }
+
+    def compare_configuration_parameters(self) -> Dict[str, Any]:
+        """Compare configuration parameters between pre and post upgrade"""
+        pre_normalized = self.normalize_data(self.pre_upgrade_data['configuration_parameters'], self.create_config_key)
+        post_normalized = self.normalize_data(self.post_upgrade_data['configuration_parameters'], self.create_config_key)
+
+        pre_keys = set(pre_normalized.keys())
+        post_keys = set(post_normalized.keys())
+
+        removed_configs = pre_keys - post_keys
+        added_configs = post_keys - pre_keys
+        common_configs = pre_keys & post_keys
+
+        modified_configs = []
+        for key in common_configs:
+            pre_record = pre_normalized[key]
+            post_record = post_normalized[key]
+
+            changes = {}
+            for field in ['current_value', 'restart_value', 'database_value', 'current_level', 'restart_level']:
+                pre_value = str(pre_record.get(field, ''))
+                post_value = str(post_record.get(field, ''))
+
+                if pre_value != post_value:
+                    changes[field] = {
+                        'pre': pre_value,
+                        'post': post_value
+                    }
+
+            if changes:
+                modified_configs.append({
+                    'key': key,
+                    'changes': changes,
+                    'pre_record': pre_record,
+                    'post_record': post_record
+                })
+
+        return {
+            'summary': {
+                'pre_count': len(self.pre_upgrade_data['configuration_parameters']),
+                'post_count': len(self.post_upgrade_data['configuration_parameters']),
+                'removed_count': len(removed_configs),
+                'added_count': len(added_configs),
+                'modified_count': len(modified_configs),
+                'unchanged_count': len(common_configs) - len(modified_configs)
+            },
+            'removed': list(removed_configs),
+            'added': list(added_configs),
+            'modified': modified_configs,
+            'pre_normalized': pre_normalized,
+            'post_normalized': post_normalized
+        }
+
+    def compare_vertica_libraries(self) -> Dict[str, Any]:
+        """Compare Vertica libraries between pre and post upgrade"""
+        pre_normalized = self.normalize_data(self.pre_upgrade_data['vertica_libraries'], self.create_library_key)
+        post_normalized = self.normalize_data(self.post_upgrade_data['vertica_libraries'], self.create_library_key)
+
+        pre_keys = set(pre_normalized.keys())
+        post_keys = set(post_normalized.keys())
+
+        removed_libraries = pre_keys - post_keys
+        added_libraries = post_keys - pre_keys
+        common_libraries = pre_keys & post_keys
+
+        # Libraries typically don't have modifiable properties, so modified count is 0
+        modified_libraries = []
+
+        return {
+            'summary': {
+                'pre_count': len(self.pre_upgrade_data['vertica_libraries']),
+                'post_count': len(self.post_upgrade_data['vertica_libraries']),
+                'removed_count': len(removed_libraries),
+                'added_count': len(added_libraries),
+                'modified_count': len(modified_libraries),
+                'unchanged_count': len(common_libraries)
+            },
+            'removed': list(removed_libraries),
+            'added': list(added_libraries),
+            'modified': modified_libraries,
+            'pre_normalized': pre_normalized,
+            'post_normalized': post_normalized
+        }
+
+    def compare_kvm_os_config(self) -> Dict[str, Any]:
+        """Compare KVM/OS configuration between pre and post upgrade"""
+        pre_normalized = self.normalize_data(self.pre_upgrade_data['kvm_os_config'], self.create_kvm_os_key)
+        post_normalized = self.normalize_data(self.post_upgrade_data['kvm_os_config'], self.create_kvm_os_key)
+
+        pre_keys = set(pre_normalized.keys())
+        post_keys = set(post_normalized.keys())
+
+        removed_configs = pre_keys - post_keys
+        added_configs = post_keys - pre_keys
+        common_configs = pre_keys & post_keys
+
+        modified_configs = []
+        for key in common_configs:
+            # Skip summary entries for modification comparison
+            if key.startswith('SUMMARY|'):
+                continue
+                
+            pre_record = pre_normalized[key]
+            post_record = post_normalized[key]
+
+            changes = {}
+            for field in ['check_status', 'check_description']:
+                pre_value = str(pre_record.get(field, ''))
+                post_value = str(post_record.get(field, ''))
+
+                if pre_value != post_value:
+                    changes[field] = {
+                        'pre': pre_value,
+                        'post': post_value
+                    }
+
+            if changes:
+                modified_configs.append({
+                    'key': key,
+                    'changes': changes,
+                    'pre_record': pre_record,
+                    'post_record': post_record
+                })
+
+        # Compare summary counts
+        pre_pass = 0
+        pre_fail = 0
+        post_pass = 0
+        post_fail = 0
+        
+        for key in pre_normalized:
+            if key.startswith('SUMMARY|'):
+                status = key.split('|')[1]
+                count = int(pre_normalized[key].get('count', 0))
+                if status == 'Pass':
+                    pre_pass = count
+                elif status == 'Fail':
+                    pre_fail = count
+                    
+        for key in post_normalized:
+            if key.startswith('SUMMARY|'):
+                status = key.split('|')[1]
+                count = int(post_normalized[key].get('count', 0))
+                if status == 'Pass':
+                    post_pass = count
+                elif status == 'Fail':
+                    post_fail = count
+
+        return {
+            'summary': {
+                'pre_pass_count': pre_pass,
+                'pre_fail_count': pre_fail,
+                'post_pass_count': post_pass,
+                'post_fail_count': post_fail,
+                'removed_count': len(removed_configs),
+                'added_count': len(added_configs),
+                'modified_count': len(modified_configs),
+                'unchanged_count': len(common_configs) - len(modified_configs)
+            },
+            'removed': list(removed_configs),
+            'added': list(added_configs),
+            'modified': modified_configs,
+            'pre_normalized': pre_normalized,
+            'post_normalized': post_normalized
+        }
+
+    def compare_schemas(self) -> Dict[str, Any]:
+        """Perform detailed comparison between pre and post upgrade schemas"""
+        print("\nPerforming comprehensive schema comparison...")
+        time.sleep(2)
+
+        # Compare all five sections
+        projection_results = self.compare_projection_columns()
+        user_results = self.compare_users()
+        config_results = self.compare_configuration_parameters()
+        library_results = self.compare_vertica_libraries()
+        kvm_os_results = self.compare_kvm_os_config()
+
+        self.comparison_results = {
+            'projection_columns': projection_results,
+            'users': user_results,
+            'configuration_parameters': config_results,
+            'vertica_libraries': library_results,
+            'kvm_os_config': kvm_os_results
+        }
+
         print(f"\nComparison completed:")
-        print(f"  - Pre-upgrade records: {self.comparison_results['summary']['pre_upgrade_count']}")
-        print(f"  - Post-upgrade records: {self.comparison_results['summary']['post_upgrade_count']}")
-        print(f"  - Removed columns: {self.comparison_results['summary']['removed_count']}")
-        print(f"  - Added columns: {self.comparison_results['summary']['added_count']}")
-        print(f"  - Modified columns: {self.comparison_results['summary']['modified_count']}")
-        print(f"  - Unchanged columns: {self.comparison_results['summary']['unchanged_count']}")
+        print(f"\nProjection Columns:")
+        print(f"  - Pre-upgrade records: {projection_results['summary']['pre_count']}")
+        print(f"  - Post-upgrade records: {projection_results['summary']['post_count']}")
+        print(f"  - Removed columns: {projection_results['summary']['removed_count']}")
+        print(f"  - Added columns: {projection_results['summary']['added_count']}")
+        print(f"  - Modified columns: {projection_results['summary']['modified_count']}")
+        print(f"  - Unchanged columns: {projection_results['summary']['unchanged_count']}")
+
+        print(f"\nUsers & Resource Pools:")
+        print(f"  - Pre-upgrade users: {user_results['summary']['pre_count']}")
+        print(f"  - Post-upgrade users: {user_results['summary']['post_count']}")
+        print(f"  - Removed users: {user_results['summary']['removed_count']}")
+        print(f"  - Added users: {user_results['summary']['added_count']}")
+        print(f"  - Modified users: {user_results['summary']['modified_count']}")
+        print(f"  - Unchanged users: {user_results['summary']['unchanged_count']}")
+
+        print(f"\nConfiguration Parameters:")
+        print(f"  - Pre-upgrade configs: {config_results['summary']['pre_count']}")
+        print(f"  - Post-upgrade configs: {config_results['summary']['post_count']}")
+        print(f"  - Removed configs: {config_results['summary']['removed_count']}")
+        print(f"  - Added configs: {config_results['summary']['added_count']}")
+        print(f"  - Modified configs: {config_results['summary']['modified_count']}")
+        print(f"  - Unchanged configs: {config_results['summary']['unchanged_count']}")
+
+        print(f"\nVertica Libraries:")
+        print(f"  - Pre-upgrade libraries: {library_results['summary']['pre_count']}")
+        print(f"  - Post-upgrade libraries: {library_results['summary']['post_count']}")
+        print(f"  - Removed libraries: {library_results['summary']['removed_count']}")
+        print(f"  - Added libraries: {library_results['summary']['added_count']}")
+        print(f"  - Modified libraries: {library_results['summary']['modified_count']}")
+        print(f"  - Unchanged libraries: {library_results['summary']['unchanged_count']}")
+
+        print(f"\nKVM/OS Configuration:")
+        print(f"  - Pre-upgrade pass count: {kvm_os_results['summary']['pre_pass_count']}")
+        print(f"  - Pre-upgrade fail count: {kvm_os_results['summary']['pre_fail_count']}")
+        print(f"  - Post-upgrade pass count: {kvm_os_results['summary']['post_pass_count']}")
+        print(f"  - Post-upgrade fail count: {kvm_os_results['summary']['post_fail_count']}")
+        print(f"  - Removed configs: {kvm_os_results['summary']['removed_count']}")
+        print(f"  - Added configs: {kvm_os_results['summary']['added_count']}")
+        print(f"  - Modified configs: {kvm_os_results['summary']['modified_count']}")
+        print(f"  - Unchanged configs: {kvm_os_results['summary']['unchanged_count']}")
 
         return self.comparison_results
 
     def generate_text_report(self, output_file: str):
-        """Generate a detailed text report"""
+        """Generate a comprehensive text report"""
         if not self.comparison_results:
             print("No comparison results available. Run compare_schemas() first.")
             return
 
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write("VERTICA SCHEMA COMPARISON REPORT\n")
-                f.write("=" * 60 + "\n")
+                f.write("VERTICA COMPREHENSIVE SCHEMA COMPARISON REPORT\n")
+                f.write("=" * 70 + "\n")
                 f.write(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-                # Summary
-                summary = self.comparison_results['summary']
-                f.write("SUMMARY\n")
-                f.write("-" * 20 + "\n")
-                f.write(f"Pre-upgrade records:  {summary['pre_upgrade_count']}\n")
-                f.write(f"Post-upgrade records: {summary['post_upgrade_count']}\n")
-                f.write(f"Removed columns:      {summary['removed_count']}\n")
-                f.write(f"Added columns:        {summary['added_count']}\n")
-                f.write(f"Modified columns:     {summary['modified_count']}\n")
-                f.write(f"Unchanged columns:    {summary['unchanged_count']}\n\n")
+                # Overall Summary
+                f.write("OVERALL SUMMARY\n")
+                f.write("-" * 30 + "\n")
 
-                # Removed columns
-                f.write("REMOVED COLUMNS\n")
-                f.write("-" * 20 + "\n")
-                if self.comparison_results['removed_columns']:
-                    for col in sorted(self.comparison_results['removed_columns']):
-                        schema, table, column = col.split('|')
-                        f.write(f"  - {schema}.{table}.{column}\n")
-                        # Add details from pre-upgrade
-                        pre_record = self.comparison_results['pre_normalized'][col]
-                        f.write(f"    Type: {pre_record.get('data_type', 'N/A')}, "
-                               f"Encoding: {pre_record.get('encoding_type', 'N/A')}, "
-                               f"Sort Position: {pre_record.get('sort_position', 'N/A')}\n")
-                else:
-                    f.write("  No columns removed\n")
-                f.write("\n")
+                for section_name, section_data in self.comparison_results.items():
+                    f.write(f"\n{section_name.replace('_', ' ').title()}:\n")
+                    summary = section_data['summary']
+                    
+                    if section_name == 'kvm_os_config':
+                        f.write(f"  Pre-upgrade pass count: {summary['pre_pass_count']}\n")
+                        f.write(f"  Pre-upgrade fail count: {summary['pre_fail_count']}\n")
+                        f.write(f"  Post-upgrade pass count: {summary['post_pass_count']}\n")
+                        f.write(f"  Post-upgrade fail count: {summary['post_fail_count']}\n")
+                    else:
+                        f.write(f"  Pre-upgrade records:  {summary['pre_count']}\n")
+                        f.write(f"  Post-upgrade records: {summary['post_count']}\n")
+                    
+                    f.write(f"  Removed items:        {summary['removed_count']}\n")
+                    f.write(f"  Added items:          {summary['added_count']}\n")
+                    f.write(f"  Modified items:       {summary['modified_count']}\n")
+                    f.write(f"  Unchanged items:      {summary['unchanged_count']}\n")
 
-                # Added columns
-                f.write("ADDED COLUMNS\n")
-                f.write("-" * 20 + "\n")
-                if self.comparison_results['added_columns']:
-                    for col in sorted(self.comparison_results['added_columns']):
-                        schema, table, column = col.split('|')
-                        f.write(f"  + {schema}.{table}.{column}\n")
-                        # Add details from post-upgrade
-                        post_record = self.comparison_results['post_normalized'][col]
-                        f.write(f"    Type: {post_record.get('data_type', 'N/A')}, "
-                               f"Encoding: {post_record.get('encoding_type', 'N/A')}, "
-                               f"Sort Position: {post_record.get('sort_position', 'N/A')}\n")
-                else:
-                    f.write("  No columns added\n")
-                f.write("\n")
+                # Detailed sections
+                for section_name, section_data in self.comparison_results.items():
+                    f.write(f"\n\n{'='*70}\n")
+                    f.write(f"{section_name.replace('_', ' ').title()} DETAILED COMPARISON\n")
+                    f.write(f"{'='*70}\n")
 
-                # Modified columns
-                f.write("MODIFIED COLUMNS\n")
-                f.write("-" * 20 + "\n")
-                if self.comparison_results['modified_columns']:
-                    for mod in self.comparison_results['modified_columns']:
-                        schema, table, column = mod['key'].split('|')
-                        f.write(f"  ~ {schema}.{table}.{column}\n")
-                        for field, change in mod['changes'].items():
-                            f.write(f"    {field}: '{change['pre']}' -> '{change['post']}'\n")
-                        f.write("\n")
-                else:
-                    f.write("  No columns modified\n")
+                    # Removed items
+                    f.write(f"\nREMOVED {section_name.replace('_', ' ').upper()}\n")
+                    f.write("-" * 40 + "\n")
+                    if section_data['removed']:
+                        for item in sorted(section_data['removed']):
+                            if section_name == 'projection_columns':
+                                schema, table, column = item.split('|')
+                                f.write(f"  - {schema}.{table}.{column}\n")
+                                pre_record = section_data['pre_normalized'][item]
+                                f.write(f"    Type: {pre_record.get('data_type', 'N/A')}, "
+                                       f"Encoding: {pre_record.get('encoding_type', 'N/A')}, "
+                                       f"Sort Position: {pre_record.get('sort_position', 'N/A')}\n")
+                            elif section_name == 'users':
+                                f.write(f"  - User: {item}\n")
+                                pre_record = section_data['pre_normalized'][item]
+                                f.write(f"    Search Path: {pre_record.get('search_path', 'N/A')}\n")
+                                f.write(f"    Resource Pool: {pre_record.get('resource_pool', 'N/A')}\n")
+                            elif section_name == 'configuration_parameters':
+                                node, param = item.split('|')
+                                f.write(f"  - {node}: {param}\n")
+                                pre_record = section_data['pre_normalized'][item]
+                                f.write(f"    Current Value: {pre_record.get('current_value', 'N/A')}\n")
+                                f.write(f"    Level: {pre_record.get('current_level', 'N/A')}\n")
+                            elif section_name == 'vertica_libraries':
+                                f.write(f"  - Library: {item}\n")
+                            elif section_name == 'kvm_os_config':
+                                if item.startswith('SUMMARY|'):
+                                    status = item.split('|')[1]
+                                    f.write(f"  - Summary Status: {status}\n")
+                                    pre_record = section_data['pre_normalized'][item]
+                                    f.write(f"    Count: {pre_record.get('count', 'N/A')}\n")
+                                else:
+                                    f.write(f"  - Check: {item}\n")
+                                    pre_record = section_data['pre_normalized'][item]
+                                    f.write(f"    Status: {pre_record.get('check_status', 'N/A')}\n")
+                    else:
+                        f.write(f"  No {section_name.replace('_', ' ')} removed\n")
 
-            print(f"Text report saved to: {output_file}")
+                    # Added items
+                    f.write(f"\nADDED {section_name.replace('_', ' ').upper()}\n")
+                    f.write("-" * 40 + "\n")
+                    if section_data['added']:
+                        for item in sorted(section_data['added']):
+                            if section_name == 'projection_columns':
+                                schema, table, column = item.split('|')
+                                f.write(f"  + {schema}.{table}.{column}\n")
+                                post_record = section_data['post_normalized'][item]
+                                f.write(f"    Type: {post_record.get('data_type', 'N/A')}, "
+                                       f"Encoding: {post_record.get('encoding_type', 'N/A')}, "
+                                       f"Sort Position: {post_record.get('sort_position', 'N/A')}\n")
+                            elif section_name == 'users':
+                                f.write(f"  + User: {item}\n")
+                                post_record = section_data['post_normalized'][item]
+                                f.write(f"    Search Path: {post_record.get('search_path', 'N/A')}\n")
+                                f.write(f"    Resource Pool: {post_record.get('resource_pool', 'N/A')}\n")
+                            elif section_name == 'configuration_parameters':
+                                node, param = item.split('|')
+                                f.write(f"  + {node}: {param}\n")
+                                post_record = section_data['post_normalized'][item]
+                                f.write(f"    Current Value: {post_record.get('current_value', 'N/A')}\n")
+                                f.write(f"    Level: {post_record.get('current_level', 'N/A')}\n")
+                            elif section_name == 'vertica_libraries':
+                                f.write(f"  + Library: {item}\n")
+                            elif section_name == 'kvm_os_config':
+                                if item.startswith('SUMMARY|'):
+                                    status = item.split('|')[1]
+                                    f.write(f"  + Summary Status: {status}\n")
+                                    post_record = section_data['post_normalized'][item]
+                                    f.write(f"    Count: {post_record.get('count', 'N/A')}\n")
+                                else:
+                                    f.write(f"  + Check: {item}\n")
+                                    post_record = section_data['post_normalized'][item]
+                                    f.write(f"    Status: {post_record.get('check_status', 'N/A')}\n")
+                    else:
+                        f.write(f"  No {section_name.replace('_', ' ')} added\n")
+
+                    # Modified items
+                    f.write(f"\nMODIFIED {section_name.replace('_', ' ').upper()}\n")
+                    f.write("-" * 40 + "\n")
+                    if section_data['modified']:
+                        for mod in section_data['modified']:
+                            if section_name == 'projection_columns':
+                                schema, table, column = mod['key'].split('|')
+                                f.write(f"  ~ {schema}.{table}.{column}\n")
+                            elif section_name == 'users':
+                                f.write(f"  ~ User: {mod['key']}\n")
+                            elif section_name == 'configuration_parameters':
+                                node, param = mod['key'].split('|')
+                                f.write(f"  ~ {node}: {param}\n")
+                            elif section_name == 'vertica_libraries':
+                                f.write(f"  ~ Library: {mod['key']}\n")
+                            elif section_name == 'kvm_os_config':
+                                if mod['key'].startswith('SUMMARY|'):
+                                    status = mod['key'].split('|')[1]
+                                    f.write(f"  ~ Summary Status: {status}\n")
+                                else:
+                                    f.write(f"  ~ Check: {mod['key']}\n")
+
+                            for field, change in mod['changes'].items():
+                                f.write(f"    {field}: '{change['pre']}' -> '{change['post']}'\n")
+                            f.write("\n")
+                    else:
+                        f.write(f"  No {section_name.replace('_', ' ')} modified\n")
+
+            print(f"Comprehensive text report saved to: {output_file}")
 
         except Exception as e:
             print(f"Error generating text report: {str(e)}")
 
-    def generate_excel_report(self, output_file: str):
-        """Generate a detailed Excel report with multiple sheets"""
-        if not self.comparison_results:
-            print("No comparison results available. Run compare_schemas() first.")
-            return
-
-        try:
-            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                # Summary sheet
-                summary_data = []
-                for key, value in self.comparison_results['summary'].items():
-                    summary_data.append({'Metric': key.replace('_', ' ').title(), 'Count': value})
-
-                summary_df = pd.DataFrame(summary_data)
-                summary_df.to_excel(writer, sheet_name='Summary', index=False)
-
-                # Removed columns sheet
-                if self.comparison_results['removed_columns']:
-                    removed_data = []
-                    for col in self.comparison_results['removed_columns']:
-                        record = self.comparison_results['pre_normalized'][col]
-                        removed_data.append(record)
-
-                    removed_df = pd.DataFrame(removed_data)
-                    removed_df.to_excel(writer, sheet_name='Removed Columns', index=False)
-
-                # Added columns sheet
-                if self.comparison_results['added_columns']:
-                    added_data = []
-                    for col in self.comparison_results['added_columns']:
-                        record = self.comparison_results['post_normalized'][col]
-                        added_data.append(record)
-
-                    added_df = pd.DataFrame(added_data)
-                    added_df.to_excel(writer, sheet_name='Added Columns', index=False)
-
-                # Modified columns sheet
-                if self.comparison_results['modified_columns']:
-                    modified_data = []
-                    for mod in self.comparison_results['modified_columns']:
-                        row = {}
-                        pre_record = mod['pre_record']
-                        post_record = mod['post_record']
-
-                        # Add basic info
-                        row['table_schema'] = pre_record.get('table_schema')
-                        row['table_name'] = pre_record.get('table_name')
-                        row['table_column_name'] = pre_record.get('table_column_name')
-
-                        # Add pre/post values for changed fields
-                        for field, change in mod['changes'].items():
-                            row[f'{field}_before'] = change['pre']
-                            row[f'{field}_after'] = change['post']
-
-                        modified_data.append(row)
-
-                    modified_df = pd.DataFrame(modified_data)
-                    modified_df.to_excel(writer, sheet_name='Modified Columns', index=False)
-
-                # Full comparison sheet
-                comparison_data = []
-                all_keys = set(self.comparison_results['pre_normalized'].keys()) | set(self.comparison_results['post_normalized'].keys())
-
-                for key in sorted(all_keys):
-                    schema, table, column = key.split('|')
-                    row = {
-                        'table_schema': schema,
-                        'table_name': table,
-                        'table_column_name': column,
-                        'status': 'Unchanged'
-                    }
-
-                    if key in self.comparison_results['removed_columns']:
-                        row['status'] = 'Removed'
-                        pre_record = self.comparison_results['pre_normalized'][key]
-                        row.update({f'pre_{k}': v for k, v in pre_record.items()})
-                    elif key in self.comparison_results['added_columns']:
-                        row['status'] = 'Added'
-                        post_record = self.comparison_results['post_normalized'][key]
-                        row.update({f'post_{k}': v for k, v in post_record.items()})
-                    else:
-                        # Check if modified
-                        for mod in self.comparison_results['modified_columns']:
-                            if mod['key'] == key:
-                                row['status'] = 'Modified'
-                                break
-
-                        pre_record = self.comparison_results['pre_normalized'][key]
-                        post_record = self.comparison_results['post_normalized'][key]
-                        row.update({f'pre_{k}': v for k, v in pre_record.items()})
-                        row.update({f'post_{k}': v for k, v in post_record.items()})
-
-                    comparison_data.append(row)
-
-                comparison_df = pd.DataFrame(comparison_data)
-                comparison_df.to_excel(writer, sheet_name='Full Comparison', index=False)
-
-            print(f"Excel report saved to: {output_file}")
-
-        except Exception as e:
-            print(f"Error generating Excel report: {str(e)}")
-
-    def generate_csv_reports(self, output_prefix: str):
-        """Generate separate CSV files for different comparison aspects"""
-        if not self.comparison_results:
-            print("No comparison results available. Run compare_schemas() first.")
-            return
-
-        try:
-            # Summary CSV
-            summary_data = []
-            for key, value in self.comparison_results['summary'].items():
-                summary_data.append({'Metric': key.replace('_', ' ').title(), 'Count': value})
-
-            summary_df = pd.DataFrame(summary_data)
-            summary_file = f"{output_prefix}_summary.csv"
-            summary_df.to_csv(summary_file, index=False)
-            print(f"Summary CSV saved to: {summary_file}")
-
-            # Removed columns CSV
-            if self.comparison_results['removed_columns']:
-                removed_data = [self.comparison_results['pre_normalized'][col]
-                              for col in self.comparison_results['removed_columns']]
-                removed_df = pd.DataFrame(removed_data)
-                removed_file = f"{output_prefix}_removed.csv"
-                removed_df.to_csv(removed_file, index=False)
-                print(f"Removed columns CSV saved to: {removed_file}")
-
-            # Added columns CSV
-            if self.comparison_results['added_columns']:
-                added_data = [self.comparison_results['post_normalized'][col]
-                            for col in self.comparison_results['added_columns']]
-                added_df = pd.DataFrame(added_data)
-                added_file = f"{output_prefix}_added.csv"
-                added_df.to_csv(added_file, index=False)
-                print(f"Added columns CSV saved to: {added_file}")
-
-            # Modified columns CSV
-            if self.comparison_results['modified_columns']:
-                modified_data = []
-                for mod in self.comparison_results['modified_columns']:
-                    row = mod['pre_record'].copy()
-                    row['changes'] = ', '.join([f"{k}: {v['pre']} -> {v['post']}"
-                                              for k, v in mod['changes'].items()])
-                    modified_data.append(row)
-
-                modified_df = pd.DataFrame(modified_data)
-                modified_file = f"{output_prefix}_modified.csv"
-                modified_df.to_csv(modified_file, index=False)
-                print(f"Modified columns CSV saved to: {modified_file}")
-
-        except Exception as e:
-            print(f"Error generating CSV reports: {str(e)}")
-
     def interactive_mode(self):
         """Run the tool in interactive mode with file discovery"""
-        print("=" * 60)
-        print("VERTICA SCHEMA COMPARISON TOOL")
-        print("=" * 60)
-        print(f"Scanning current directory: {Path.cwd()}")
+        print("=" * 70)
+        print("ENHANCED VERTICA SCHEMA COMPARISON TOOL")
+        print("=" * 70)
+        print(f"Scanning directory: {Path.cwd().parent / 'Reports'}")
+        print()
+        print("****Note :- If your files is in Archive Dir, then plz move it to /Reports Dir")
 
         # Discover files
         pre_files, post_files = self.discover_schema_files()
@@ -487,29 +773,21 @@ class SchemaFileComparator:
         # Load and compare files
         self.load_files(pre_file, post_file)
 
-        if not self.pre_upgrade_data and not self.post_upgrade_data:
-            print("Error: No data loaded from either file")
-            return False
-
         # Perform comparison
         self.compare_schemas()
 
         # Generate reports
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_prefix = f"schema_comparison_{timestamp}"
+        output_file = f"../Reports/comprehensive_schema_comparison_{timestamp}.txt"
 
-        print(f"\nGenerating comparison reports...")
-        self.generate_text_report(f"../Reports/{output_prefix}.txt")
-        #self.generate_excel_report(f"{output_prefix}.xlsx")
-        #self.generate_csv_reports(output_prefix)
+        print(f"\nGenerating comprehensive comparison report...")
+        self.generate_text_report(output_file)
 
-        print(f"\n" + "=" * 60)
-        print("COMPARISON COMPLETED SUCCESSFULLY!")
-        print("=" * 60)
+        print(f"\n" + "=" * 70)
+        print("COMPREHENSIVE COMPARISON COMPLETED SUCCESSFULLY!")
+        print("=" * 70)
         print("Generated files:")
-        print(f"  - Text report: {output_prefix}.txt")
-        #print(f"  - Excel report: {output_prefix}.xlsx")
-        #print(f"  - CSV reports: {output_prefix}_*.csv")
+        print(f"  - Comprehensive text report: {Path(output_file).name}")
 
         return True
 
@@ -518,10 +796,6 @@ def main():
     parser = argparse.ArgumentParser(description='Enhanced Vertica Schema File Comparison Tool')
     parser.add_argument('--pre-file', help='Pre-upgrade schema file path (optional in interactive mode)')
     parser.add_argument('--post-file', help='Post-upgrade schema file path (optional in interactive mode)')
-    parser.add_argument('--output-format', choices=['text', 'excel', 'csv', 'all'], default='text',
-                       help='Output format for comparison report (default: text)')
-    parser.add_argument('--output-prefix', default='schema_comparison',
-                       help='Output file prefix (default: schema_comparison)')
     parser.add_argument('--interactive', '-i', action='store_true',
                        help='Run in interactive mode with automatic file discovery')
 
@@ -534,7 +808,7 @@ def main():
     if args.interactive or (not args.pre_file and not args.post_file):
         return comparator.interactive_mode()
 
-    # Validate input files exist (command line mode)
+    # Command line mode
     if not args.pre_file or not args.post_file:
         print("Error: Both --pre-file and --post-file are required in non-interactive mode")
         print("Use --interactive or -i flag for interactive file selection")
@@ -550,31 +824,15 @@ def main():
 
     # Load files and perform comparison
     comparator.load_files(args.pre_file, args.post_file)
-
-    if not comparator.pre_upgrade_data and not comparator.post_upgrade_data:
-        print("Error: No data loaded from either file")
-        sys.exit(1)
-
-    # Perform comparison
     comparator.compare_schemas()
 
     # Generate reports
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_file = f"comprehensive_schema_comparison_{timestamp}.txt"
+    comparator.generate_text_report(output_file)
 
-    if args.output_format in ['text', 'all']:
-        text_file = f"{args.output_prefix}_{timestamp}.txt"
-        comparator.generate_text_report(text_file)
-
-    if args.output_format in ['excel', 'all']:
-        excel_file = f"{args.output_prefix}_{timestamp}.xlsx"
-        comparator.generate_excel_report(excel_file)
-
-    if args.output_format in ['csv', 'all']:
-        csv_prefix = f"{args.output_prefix}_{timestamp}"
-        comparator.generate_csv_reports(csv_prefix)
-
-    print(f"\nSchema comparison completed successfully!")
-    print(f"Check the generated report files for detailed analysis.")
+    print(f"\nComprehensive schema comparison completed successfully!")
+    print(f"Check the generated report file: {output_file}")
 
 
 if __name__ == "__main__":
@@ -585,4 +843,3 @@ if __name__ == "__main__":
         comparator.interactive_mode()
     else:
         main()
-
